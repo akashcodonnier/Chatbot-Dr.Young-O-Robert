@@ -600,22 +600,22 @@ try:
     pass
     
     logger.info("🚀 STARTING MULTI-SITE SCRAPING")
-    
-    # Scrape from main WordPress site
+
+    # Scrape Dr. Robert Young's blog FIRST (REST API - fast, no categories)
+    logger.info("\n=== DRROBERTYOUNG.COM/BLOG ===")
+    blog_articles, blog_category_stats = scrape_dr_young_blog()
+
+    # Scrape WordPress site second
     logger.info("\n=== PHOREVERYOUNG.WORDPRESS.COM ===")
     all_categories = discover_all_categories()
     ALL_CATEGORIES = all_categories
     wp_articles, wp_category_stats = scrape_all_categories()
-    
-    # Scrape from Dr. Robert Young's blog
-    logger.info("\n=== DRROBERTYOUNG.COM/BLOG ===")
-    blog_articles, blog_category_stats = scrape_dr_young_blog()
-    
+
     # Log final statistics
     logger.info("\n🎉 MULTI-SITE SCRAPING COMPLETED")
+    logger.info(f"Blog Articles: {blog_articles}")
     logger.info(f"WordPress Categories: {len(all_categories)}")
     logger.info(f"WordPress Articles: {wp_articles}")
-    logger.info(f"Blog Articles: {blog_articles}")
     logger.info(f"Total Articles Scraped: {wp_articles + blog_articles}")
     
     # Detailed category breakdown

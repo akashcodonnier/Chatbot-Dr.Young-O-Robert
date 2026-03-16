@@ -81,7 +81,7 @@ def load_article_cache():
         print("\n[CACHE] Loading article embeddings into memory...")
         conn = get_connection()
         cur = conn.cursor(dictionary=True)
-        cur.execute("SELECT id, title, url, content, category, published_date, embedding FROM dr_young_all_articles")
+        cur.execute("SELECT id, title, url, content, embedding FROM dr_young_all_articles")
         rows = cur.fetchall()
         cur.close()
         conn.close()
@@ -94,8 +94,6 @@ def load_article_cache():
                     "title": r["title"],
                     "url": r["url"],
                     "content": r["content"],
-                    "category": r["category"],
-                    "published_date": r["published_date"],
                     "embedding": emb
                 })
             except Exception:

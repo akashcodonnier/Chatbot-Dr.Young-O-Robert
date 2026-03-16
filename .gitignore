@@ -12,6 +12,7 @@ __pycache__/
 venv/
 .env/
 .venv/
+.env.example/
 
 
 # Environment variables
