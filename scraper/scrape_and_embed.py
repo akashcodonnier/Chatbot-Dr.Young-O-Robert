@@ -325,12 +325,19 @@ def scrape_single_category(category_slug):
         logger.info(f"📄 Found {len(articles)} articles on page: {page_url}")
         
         for i, art in enumerate(articles, 1):
-            # Extract article URL
-            title_link = art.find("a", href=True)
+            # Extract article URL - use rel="bookmark" (WordPress permalink) first
+            title_link = (
+                art.find("a", rel="bookmark", href=True) or
+                (art.find(class_="entry-title") and art.find(class_="entry-title").find("a", href=True)) or
+                art.find("h2", class_=lambda c: c and "title" in c and art.find("a", href=True)) or
+                art.find("a", href=True)
+            )
             if not title_link:
                 continue
 
-            url = title_link["href"]
+            url = title_link.get("href")
+            if not url:
+                continue
 
             # Check if article already exists in database (by URL)
             cur.execute("SELECT 1 FROM dr_young_all_articles WHERE url=%s", (url,))
@@ -348,6 +355,13 @@ def scrape_single_category(category_slug):
                     timeout=10,
                     verify=False
                 )
+                detail_soup = BeautifulSoup(detail_res.text, "html.parser")
+                # Use canonical URL if available (most accurate article URL)
+                canonical = detail_soup.find("link", rel="canonical")
+                if canonical and canonical.get("href"):
+                    url = canonical["href"]
+                elif detail_res.url != url:
+                    url = detail_res.url  # Use final URL after redirects
             except Exception as e:
                 logger.warning(f"⚠️ Failed to fetch article {url}: {e}")
                 continue
@@ -418,7 +432,7 @@ def scrape_single_category(category_slug):
 
         # Get next page URL for pagination
         next_link = soup.find("a", class_="next")
-        page_url = urljoin(base_url, next_link["href"]) if next_link else None
+        page_url = urljoin(base_url, next_link["href"]) if next_link and next_link.get("href") else None
         if page_url:
             logger.info(f"➡️ Moving to next page: {page_url}")
             time.sleep(PAGE_DELAY)
@@ -471,161 +485,108 @@ def scrape_all_categories():
 
 def scrape_dr_young_blog():
     """
-    Scrape articles from Dr. Robert Young's blog (https://drrobertyoung.com/blog/)
-    
-    This function scrapes articles from the main blog page and all category pages,
-    extracts their content, generates embeddings, and stores them in the database.
-    
+    Scrape all articles from Dr. Robert Young's blog using WordPress REST API.
+    Uses paginated API calls (100 posts per page) to get all articles reliably.
+
     Returns:
-        tuple: (total_articles, category_stats_dict) - Total articles and per-category stats
+        tuple: (total_articles, category_stats_dict)
     """
     total_articles = 0
-    category_stats = {}
-    
-    logger.info("🚀 SCRAPING DR. ROBERT YOUNG BLOG")
-    
-    # First, discover all blog categories
-    try:
-        response = requests.get(DR_YOUNG_BLOG_URL, headers=HEADERS, timeout=15)
-        soup = BeautifulSoup(response.text, "html.parser")
-        
-        # Find category links
-        category_links = soup.find_all('a', href=re.compile(r'https://drrobertyoung\.com/[^/]+/$'))
-        categories = set()
-        
-        for link in category_links:
-            href = link.get('href')
-            if href and 'drrobertyoung.com' in href:
-                # Extract category from URL
-                category = href.rstrip('/').split('/')[-1]
-                if category and category not in ['blog', 'wp-content', 'wp-admin']:
-                    categories.add(category)
-        
-        logger.info(f"✅ FOUND {len(categories)} BLOG CATEGORIES: {sorted(categories)}")
-        
-        # Add main blog URL to scrape uncategorized posts
-        urls_to_scrape = [DR_YOUNG_BLOG_URL] + [f"https://drrobertyoung.com/{cat}/" for cat in categories]
-        
-    except Exception as e:
-        logger.error(f"❌ Failed to discover blog categories: {e}")
-        # Fallback to main blog page only
-        urls_to_scrape = [DR_YOUNG_BLOG_URL]
-    
-    # Scrape each URL
-    for url in urls_to_scrape:
-        logger.info(f"🔍 Scraping: {url}")
+    category_stats = {"drrobertyoung_blog": 0}
+    REST_API_URL = "https://drrobertyoung.com/wp-json/wp/v2/posts"
+    PER_PAGE = 100
+
+    logger.info("🚀 SCRAPING DR. ROBERT YOUNG BLOG (via WordPress REST API)")
+
+    page = 1
+    while True:
         try:
-            response = requests.get(url, headers=HEADERS, timeout=15)
-            soup = BeautifulSoup(response.text, "html.parser")
-            
-            # Find all post elements (this site uses 'post' class instead of article tags)
-            post_elements = soup.find_all(class_=re.compile(r'post'))
-            logger.info(f"📄 Found {len(post_elements)} post elements")
-            
-            # Extract links from post elements
-            article_links = []
-            for post in post_elements:
-                # Look for links within each post
-                links = post.find_all('a', href=re.compile(r'https://drrobertyoung\.com/'))
-                article_links.extend(links)
-            
-            # Also look for direct post links on the page
-            direct_post_links = soup.find_all('a', href=re.compile(r'https://drrobertyoung\.com/[^/]+/[^/]+/$'))
-            article_links.extend(direct_post_links)
-            
-            # Remove duplicates and filter out non-article links
-            article_links = list(set([link for link in article_links 
-                                    if link.get('href') and 
-                                       'drrobertyoung.com' in link.get('href') and
-                                       not any(skip in link.get('href') for skip in 
-                                               ['/category/', '/tag/', '/page/', '#', '?', '.jpg', '.png'])]))
-            
-            logger.info(f"📄 Found {len(article_links)} potential articles")
-            
-            # Debug: Show first few links found
-            if article_links:
-                logger.debug(f"First 3 article links: {[link.get('href') for link in article_links[:3]]}")
-            
-            category_name = url.rstrip('/').split('/')[-1] if url != DR_YOUNG_BLOG_URL else 'main_blog'
-            category_article_count = 0
-            
-            for i, link in enumerate(article_links, 1):
-                article_url = link.get('href')
-                if not article_url:
-                    continue
-                
-                # Check if article already exists in database (by URL)
-                cur.execute("SELECT 1 FROM dr_young_all_articles WHERE url=%s", (article_url,))
-                result = cur.fetchone()
-                cur.fetchall()  # Consume any remaining results
-                if result:
-                    logger.debug(f"⏭️ Skipping existing article by URL: {article_url}")
-                    continue
-                
-                # Fetch article content
-                try:
-                    detail_res = requests.get(article_url, headers=HEADERS, timeout=10, verify=False)
-                    detail_soup = BeautifulSoup(detail_res.text, "html.parser")
-                except Exception as e:
-                    logger.warning(f"⚠️ Failed to fetch {article_url}: {e}")
-                    continue
-                
-                # Extract title
-                title_elem = detail_soup.find("h1") or detail_soup.find(class_="entry-title")
-                title = title_elem.get_text(strip=True) if title_elem else "Untitled"
-                
-                # Extract content
-                content = extract_clean_article_content(detail_soup)
-                if len(content) < MIN_CONTENT_LENGTH:
-                    logger.debug(f"⏭️ Content too short for {title}")
-                    continue
-                
-                # Generate embedding
-                embedding = model.encode(content).tolist()
-                
-                # Check for duplicates: if same title AND same content, skip
-                cur.execute("SELECT title, content FROM dr_young_all_articles WHERE title = %s", (title,))
-                result = cur.fetchone()
-                cur.fetchall()  # Consume any remaining results
-                if result:
-                    existing_title, existing_content = result
-                    # If content is also the same, skip (true duplicate)
-                    if existing_content == content:
-                        logger.debug(f"⏭️ Skipping exact duplicate (same title and content): {title}")
-                        continue
-                    else:
-                        # Same title but different content - this is a different article, so proceed
-                        logger.debug(f"📝 Same title but different content found: {title}")
-                        # Continue with insertion below
-                
-                # Insert into database
-                cur.execute("""
-                    INSERT INTO dr_young_all_articles
-                    (title, url, content, embedding)
-                    VALUES (%s, %s, %s, %s)
-                """, (title, article_url, content, str(embedding)))
-                
-                # Get the ID of the inserted row
-                inserted_id = cur.lastrowid
-                conn.commit()
-                total_articles += 1
-                category_article_count += 1
-                logger.info(f"✅ [{category_name}] INSERTED (ID: {inserted_id}): {title}")
-                
-                # Delay between articles
-                time.sleep(ARTICLE_DELAY)
-                
-            # Update category stats
-            category_stats[category_name] = category_article_count
-            
+            resp = requests.get(
+                REST_API_URL,
+                params={"per_page": PER_PAGE, "page": page, "_fields": "id,title,link,content"},
+                headers=HEADERS,
+                timeout=30
+            )
         except Exception as e:
-            logger.error(f"❌ Failed to scrape {url}: {e}")
-            continue
-        
-        # Delay between categories/pages
+            logger.error(f"❌ API request failed (page {page}): {e}")
+            break
+
+        # 400 means no more pages
+        if resp.status_code == 400:
+            logger.info(f"✅ No more pages after page {page - 1}")
+            break
+
+        if resp.status_code != 200:
+            logger.error(f"❌ API returned status {resp.status_code} on page {page}")
+            break
+
+        posts = resp.json()
+        if not posts:
+            logger.info(f"✅ Empty response, done at page {page}")
+            break
+
+        logger.info(f"📄 Page {page}: {len(posts)} posts fetched from REST API")
+
+        for post in posts:
+            article_url = post.get("link", "")
+            title = BeautifulSoup(post.get("title", {}).get("rendered", ""), "html.parser").get_text(strip=True) or "Untitled"
+            content_html = post.get("content", {}).get("rendered", "")
+
+            if not article_url or not content_html:
+                continue
+
+            # Check if already exists in DB
+            cur.execute("SELECT 1 FROM dr_young_all_articles WHERE url=%s", (article_url,))
+            result = cur.fetchone()
+            cur.fetchall()
+            if result:
+                logger.debug(f"⏭️ Skipping existing: {article_url}")
+                continue
+
+            # Parse content HTML
+            content_soup = BeautifulSoup(content_html, "html.parser")
+            content = extract_clean_article_content(content_soup)
+
+            # Fallback: plain text if selectors return nothing
+            if len(content) < MIN_CONTENT_LENGTH:
+                content = content_soup.get_text(" ", strip=True)
+
+            if len(content) < MIN_CONTENT_LENGTH:
+                logger.debug(f"⏭️ Content too short for: {title}")
+                continue
+
+            # Check duplicate by title + content
+            cur.execute("SELECT content FROM dr_young_all_articles WHERE title = %s", (title,))
+            dup = cur.fetchone()
+            cur.fetchall()
+            if dup and dup[0] == content:
+                logger.debug(f"⏭️ Exact duplicate skipped: {title}")
+                continue
+
+            # Generate embedding
+            embedding = model.encode(content).tolist()
+
+            # Insert into DB
+            cur.execute("""
+                INSERT INTO dr_young_all_articles (title, url, content, embedding)
+                VALUES (%s, %s, %s, %s)
+            """, (title, article_url, content, str(embedding)))
+            inserted_id = cur.lastrowid
+            conn.commit()
+            total_articles += 1
+            category_stats["drrobertyoung_blog"] += 1
+            logger.info(f"✅ [drrobertyoung_blog] INSERTED (ID: {inserted_id}): {title}")
+
+            time.sleep(0.5)  # Light delay (no HTML page fetch needed)
+
+        if len(posts) < PER_PAGE:
+            # Last page reached
+            break
+
+        page += 1
         time.sleep(PAGE_DELAY)
-    
-    logger.info(f"🏁 FINISHED DR. ROBERT YOUNG BLOG SCRAPING: {total_articles} articles")
+
+    logger.info(f"🏁 FINISHED DR. ROBERT YOUNG BLOG: {total_articles} articles ({page} pages)")
     return total_articles, category_stats
 
 

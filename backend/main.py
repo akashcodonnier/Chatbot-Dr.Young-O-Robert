@@ -31,13 +31,8 @@ from pydantic import BaseModel
 import requests
 from sentence_transformers import SentenceTransformer
 
-# Groq API for cloud LLM inference
-try:
-    from groq import Groq
-    GROQ_AVAILABLE = True
-except ImportError:
-    GROQ_AVAILABLE = False
-    print("[WARNING] Groq library not installed. Cloud deployment will not work.")
+# Using only local Ollama for LLM
+print("[INFO] Using only Ollama (local mode).")
 
 # Local imports
 # Add the project root directory to the Python path
@@ -54,34 +49,67 @@ app = FastAPI(
 )
 
 # Initialize embedding model for vector search
-# Using all-MiniLM-L6-v2 for efficient sentence embeddings
 import torch
+import warnings
+import logging
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+warnings.filterwarnings("ignore", category=FutureWarning)
+logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
 
 device = "cpu"
-
+print("[MODEL] Loading embedding model (from local cache)...")
 embed_model = SentenceTransformer(
     "all-MiniLM-L6-v2",
     device=device
 )
+print("[MODEL] Embedding model ready!")
 
-# Initialize Groq client for cloud LLM (if API key available)
-groq_client = None
-if GROQ_AVAILABLE:
-    groq_api_key = os.getenv("GROQ_API_KEY")
-    if groq_api_key:
-        try:
-            groq_client = Groq(api_key=groq_api_key)
-            print("[LLM] OK - Groq API initialized (Cloud mode)")
-        except Exception as e:
-            print(f"[LLM] ERROR - Groq initialization failed: {e}")
-            groq_client = None
-    else:
-        print("[LLM] Using Ollama (Local mode - no GROQ_API_KEY found)")
-else:
-    print("[LLM] Using Ollama (Local mode - groq library not installed)")
+print("[LLM] Using Ollama (Local mode)")
 
 # Session-based conversation memory (stores last 5 interactions per conversation)
 conversation_memory = {}
+
+# ─── Embedding Cache ───────────────────────────────────────────────────────────
+# Load all article embeddings into memory at startup (fast in-memory search)
+article_cache = []  # List of dicts: {id, title, url, embedding (numpy array)}
+
+def load_article_cache():
+    """Load all article embeddings from DB into memory at startup"""
+    global article_cache
+    try:
+        print("\n[CACHE] Loading article embeddings into memory...")
+        conn = get_connection()
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT id, title, url, content, category, published_date, embedding FROM dr_young_all_articles")
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        new_cache = []
+        for r in rows:
+            try:
+                emb = np.array(ast.literal_eval(r["embedding"]))
+                new_cache.append({
+                    "id": r["id"],
+                    "title": r["title"],
+                    "url": r["url"],
+                    "content": r["content"],
+                    "category": r["category"],
+                    "published_date": r["published_date"],
+                    "embedding": emb
+                })
+            except Exception:
+                continue
+        article_cache = new_cache  # Atomic swap
+        print(f"[CACHE] Loaded {len(article_cache)} articles into memory!")
+    except Exception as e:
+        print(f"[CACHE] Failed to load cache: {e}")
+
+# Load cache at startup in background
+import threading
+threading.Thread(target=load_article_cache, daemon=True).start()
+# ──────────────────────────────────────────────────────────────────────────────
+
 
 def warm_up_ollama_model():
     """
@@ -93,9 +121,9 @@ def warm_up_ollama_model():
         response = requests.post(
             "http://localhost:11434/api/generate",
             json={
-                "model": "llama2:latest",
+                "model": "llama3.2:latest",        # Use llama3.2 for better accuracy
                 "prompt": "Hello",
-                "stream": False
+                "stream": True
             },
             timeout=60
         )
@@ -107,8 +135,8 @@ def warm_up_ollama_model():
         print(f"[OLLAMA] Warm-up failed: {e}")
         print("[OLLAMA] Model will load on first request (may take 10-15 seconds)")
 
+
 # Warm up model on startup (run in background to not block server start)
-import threading
 threading.Thread(target=warm_up_ollama_model, daemon=True).start()
 
 def get_conversation_history(conversation_id: str):
@@ -180,54 +208,12 @@ def clean_context(text: str) -> str:
     # Remove standalone reference sections at the end (but keep inline URLs and references)
     text = re.sub(r"\n\s*References?\s*:\s*$", "", text, flags=re.MULTILINE | re.IGNORECASE)
 
+    # Normalize spelling of Zeolite (remove accents)
+    text = text.replace("Zeolité", "Zeolite")
+
     return text.strip()
 
 
-# List of terms to avoid in responses to maintain neutrality
-FORBIDDEN_TERMS = [
-    "ph.d", "m.sc", "d.sc", "naturopath",
-    "disseminated", "coagulation", "dic",
-    "pathology", "mechanism", "theoretical",
-    "robert", "young"
-]
-
-
-def sanitize_answer(text: str, question: str) -> str:
-    """
-    Sanitize answer based on question type
-    
-    This function applies specific response patterns for certain types of questions
-    to ensure scientifically accurate and appropriately cautious responses.
-    
-    Args:
-        text (str): Original answer text from LLM
-        question (str): Original user question
-        
-    Returns:
-        str: Potentially modified answer based on question type
-    """
-    q = question.lower()
-
-    # Case 1: Handle questions about study size or proof
-    if any(k in q for k in ["small", "three", "prove", "study"]):
-        return (
-            "Based on the information provided in the blog context, the study is exploratory "
-            "and limited by its very small sample size. It cannot establish proof that the "
-            "intervention removes toxins from the human body. The findings provide only initial "
-            "observations, and larger, well-controlled studies would be required to draw "
-            "definitive conclusions."
-        )
-
-    # Case 2: Handle questions about product differences or comparisons
-    if any(k in q for k in ["different", "compare", "market", "other"]):
-        return (
-            "The blog context does not explicitly provide information about the study size, "
-            "its stated purpose, or its methodological limitations in relation to this question. "
-            "As a result, no conclusions can be drawn based on the available information. "
-            "Further well-controlled studies would be required to address this topic."
-        )
-
-    return text
 
 
 def call_llama2_stream(prompt: str):
@@ -248,24 +234,18 @@ def call_llama2_stream(prompt: str):
         Exception: If connection to Ollama fails or streaming encounters errors
     """
     try:
-        # Test Ollama connection first
-        test_response = requests.get("http://localhost:11434/api/tags", timeout=5)
-        if test_response.status_code != 200:
-            yield "[LLM ERROR]: Ollama service not responding"
-            return
-
         # Establish streaming POST request to Ollama API
         with requests.post(
             "http://localhost:11434/api/generate",
             json={
-                "model": "llama2:latest",           # Specify LLaMA2 model
+                "model": "llama3.2:latest",         # Use llama3.2 for better accuracy
                 "prompt": prompt,                   # Complete prompt with context
                 "stream": True,                     # Enable streaming mode
                 "options": {
-                    "temperature": 0.7,             # Control randomness (0.7 = balanced creativity)
+                    "temperature": 0.1,             # Low temperature for factual accuracy
                     "top_p": 0.9,                   # Nucleus sampling parameter
                     "repeat_penalty": 1.2,          # Penalize repeated tokens
-                    "num_predict": 500              # Maximum tokens to generate
+                    "num_predict": 800              # Maximum tokens to generate
                 }
             },
             stream=True,                            # Enable response streaming
@@ -294,7 +274,8 @@ def call_llama2_stream(prompt: str):
                     # Yield response content if available
                     if "response" in data and data["response"]:
                         received_response = True
-                        yield data["response"]
+                        chunk = data["response"].replace("Zeolité", "Zeolite")
+                        yield chunk
 
                     # Stop streaming when generation is complete
                     if data.get("done"):
@@ -342,14 +323,14 @@ def call_llama2_stream_direct(prompt: str):
         with requests.post(
             "http://localhost:11434/api/generate",
             json={
-                "model": "llama2:latest",           # Specify LLaMA2 model
+                "model": "llama3.2:latest",         # Use llama3.2 for better accuracy
                 "prompt": prompt,                   # Complete prompt with context
                 "stream": True,                     # Enable streaming mode
                 "options": {
-                    "temperature": 0.7,             # Control randomness (0.7 = balanced creativity)
+                    "temperature": 0.1,             # Low temperature for factual accuracy
                     "top_p": 0.9,                   # Nucleus sampling parameter
                     "repeat_penalty": 1.2,          # Penalize repeated tokens
-                    "num_predict": 500              # Maximum tokens to generate
+                    "num_predict": 800              # Maximum tokens to generate
                 }
             },
             stream=True,                            # Enable response streaming
@@ -366,7 +347,8 @@ def call_llama2_stream_direct(prompt: str):
 
                 # Yield response content if available
                 if "response" in data:
-                    yield data["response"]
+                    chunk = data["response"].replace("Zeolité", "Zeolite")
+                    yield chunk
 
                 # Stop streaming when generation is complete
                 if data.get("done"):
@@ -376,131 +358,6 @@ def call_llama2_stream_direct(prompt: str):
         # Handle streaming errors gracefully
         yield f"\n[LLM ERROR]: {str(e)}"
 
-
-def call_groq_stream(prompt: str):
-    """
-    Call Groq API with streaming capability (for cloud deployment)
-
-    Groq provides ultra-fast LLM inference with streaming support.
-    Uses llama-3.1-70b-versatile which is significantly more powerful
-    and faster than llama2:7b.
-
-    Benefits over Ollama:
-    - 10x faster response time (1-2s vs 10-15s)
-    - Better quality (70B vs 7B parameters)
-    - No local resources needed
-    - Perfect for Railway/cloud deployment
-
-    Args:
-        prompt (str): Formatted prompt including context and question
-
-    Yields:
-        str: Response chunks from the LLM as they are generated
-
-    Raises:
-        Exception: If Groq API fails or streaming encounters errors
-    """
-    try:
-        if not groq_client:
-            yield "[LLM ERROR]: Groq client not initialized. Check GROQ_API_KEY environment variable."
-            return
-
-        # Call Groq API with streaming
-        chat_completion = groq_client.chat.completions.create(
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You ARE Dr. Robert O. Young. You are NOT an AI assistant - you are Dr. Young himself answering questions.\n\n"
-                        "CRITICAL RULES:\n"
-                        "- NEVER say 'As an AI', 'Based on Dr. Young's research', 'According to Dr. Young', "
-                        "'As I have emphasized in my research', or any phrase that reveals you are AI\n"
-                        "- NEVER refer to yourself in third person. Do NOT say 'Dr. Young's work shows...' - "
-                        "instead say 'My research shows...'\n"
-                        "- Answer naturally as if you are the expert directly speaking to the person\n"
-                        "- Speak with authority and confidence as the researcher who did this work\n\n"
-                        "Your expertise: New Biology, pH Miracle lifestyle, cellular health, detoxification, "
-                        "alkaline nutrition, structured water.\n\n"
-                        "STRICT RULES:\n"
-                        "- ONLY use information from the provided context. Do NOT add any facts, chemicals, or claims not in the context.\n"
-                        "- Include ALL specific numbers, percentages, measurements exactly as they appear in the context. Do not skip any data.\n"
-                        "- Include ALL chemical names, cell types, and scientific abbreviations from the context.\n"
-                        "- Never make claims beyond what the provided content supports.\n"
-                        "- Do NOT include any URLs or links in your answer. URLs will be added separately."
-                    )
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            model="llama-3.3-70b-versatile",  # Updated 70B model - much better than llama2:7B
-            temperature=0.7,
-            max_tokens=500,
-            top_p=0.9,
-            stream=True,
-        )
-
-        # Stream response chunks as they arrive
-        for chunk in chat_completion:
-            if chunk.choices[0].delta.content:
-                yield chunk.choices[0].delta.content
-                # Add small delay to make response feel more natural
-                time.sleep(0.08)  # Increased to 80ms delay between chunks
-
-    except Exception as e:
-        yield f"[LLM ERROR]: {type(e).__name__} - {str(e)}"
-
-
-def call_groq_stream_direct(prompt: str):
-    """
-    Call Groq API with streaming for direct responses (Case 3 fallback)
-
-    Same as call_groq_stream but optimized for direct answer generation
-    without database context.
-
-    Args:
-        prompt (str): Formatted prompt
-
-    Yields:
-        str: Response chunks from the LLM
-    """
-    try:
-        if not groq_client:
-            yield "[LLM ERROR]: Groq client not initialized"
-            return
-
-        chat_completion = groq_client.chat.completions.create(
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You ARE Dr. Robert O. Young. Never say 'As an AI' or refer to yourself in third person. "
-                        "Answer naturally as the expert. ONLY use information from the provided context. "
-                        "Do NOT add facts or claims not in the context. Include ALL numbers, percentages, "
-                        "and scientific terms exactly as they appear. Do NOT include URLs."
-                    )
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            model="llama-3.3-70b-versatile",
-            temperature=0.7,
-            max_tokens=500,
-            top_p=0.9,
-            stream=True,
-        )
-
-        for chunk in chat_completion:
-            if chunk.choices[0].delta.content:
-                yield chunk.choices[0].delta.content
-                # Add small delay to make response feel more natural
-                time.sleep(0.08)  # Increased to 80ms delay between chunks
-
-    except Exception as e:
-        yield f"\n[LLM ERROR]: {type(e).__name__} - {str(e)}"
 
 
 @app.post("/chat")
@@ -526,16 +383,6 @@ async def chat(q: ChatRequest):
     # Log conversation tracking
     print(f"[SESSION] CONVERSATION: {q.conversation_id}")
     print(f"[HISTORY] LENGTH: {len(history)} interactions")
-    
-    # Build context from conversation history
-    history_context = ""
-    if history:
-        history_lines = []
-        for item in history:
-            history_lines.append(f"Previous question: {item['question']}")
-            history_lines.append(f"Previous answer: {item['answer']}")
-        history_context = "\n".join(history_lines) + "\n"
-        print(f"[CONTEXT] LINES ADDED: {len(history_lines)}")
 
     # 1️⃣ Embed user question using sentence transformer
     embed_start = time.time()
@@ -546,36 +393,68 @@ async def chat(q: ChatRequest):
     )
     embed_time = time.time() - embed_start
 
-    # 2️⃣ Fetch articles from database
+    # 2️⃣ Open DB connection (only for fetching content of top match later)
     db_start = time.time()
     conn = get_connection()
     cur = conn.cursor(dictionary=True)
-    cur.execute("SELECT title, content, embedding, url FROM dr_young_all_articles")
-    rows = cur.fetchall()
     db_time = time.time() - db_start
 
     # Prepare list to store similarity scores
     scored = []
 
-    # 3️⃣ Perform vector similarity search
+    # 3️⃣ Perform vector similarity search using in-memory cache
     search_start = time.time()
-    for r in rows:
-        # Convert stored embedding string back to numpy array
-        emb = np.array(ast.literal_eval(r["embedding"]))
-        # Calculate cosine similarity with query
-        score = cosine(query_emb, emb)
+    highest_score = 0.0
+    for art in article_cache:
+        # Calculate cosine similarity with query (embedding already parsed)
+        score = cosine(query_emb, art["embedding"])
 
-        # Boost score if query terms appear in title
-        if any(word in r["title"].lower() for word in q.question.lower().split()):
-            score += 0.1
+        # Boost score based on keyword matching in title and content
+        skip_words = {"what", "how", "why", "is", "the", "a", "an", "does", "do", "can", "from", "to", "of", "in", "and", "or", "for", "this", "that", "it", "i", "me", "my", "give", "explain", "example", "about", "tell", "mean", "really", "help", "need", "using", "after", "long", "term", "these", "those", "them", "their", "such"}
+        meaningful_words = [w for w in q.question.lower().split() if w not in skip_words and len(w) > 2]
 
-        # Only consider results above threshold
-        if score > 0.30:
-            scored.append((score, r))
+        if meaningful_words:
+            title_lower = art["title"].lower()
+            content_lower = (art.get("content") or "")[:3000].lower()
 
-    # Sort by similarity score and take top result
-    scored = sorted(scored, key=lambda x: x[0], reverse=True)[:1]
+            # Count how many query words match in title
+            title_matches = sum(1 for w in meaningful_words if w in title_lower)
+            # Count how many query words match in content
+            content_matches = sum(1 for w in meaningful_words if w in content_lower)
+
+            # Title match boost: 0.05 per matching word (max 0.15)
+            score += min(title_matches * 0.05, 0.15)
+            # Content match boost: 0.02 per matching word (max 0.10)
+            score += min(content_matches * 0.02, 0.10)
+        
+        if score > highest_score:
+            highest_score = score
+
+        # Only consider results above threshold (filters out unrelated questions)
+        if score > 0.25:
+            scored.append((score, art))
+
+    # Sort by similarity score, deduplicate by title, take top 2
+    scored = sorted(scored, key=lambda x: x[0], reverse=True)
+    seen_titles = set()
+    unique_scored = []
+    for s, art in scored:
+        title_key = art["title"].strip().lower()
+        if title_key not in seen_titles:
+            seen_titles.add(title_key)
+            unique_scored.append((s, art))
+        if len(unique_scored) == 2:
+            break
+    scored = unique_scored
     search_time = time.time() - search_start
+
+    # Log top matches score for debugging
+    print(f"[SEARCH] Highest score found: {highest_score:.3f}")
+    if scored:
+        for i, (score, art) in enumerate(scored, 1):
+            print(f"[SEARCH] Match {i}: '{art['title'][:50]}' score={score:.3f}")
+    else:
+        print(f"[SEARCH] No match above 0.25 for: '{q.question}'")
 
     # Return if no relevant results found
     if not scored:
@@ -617,15 +496,10 @@ async def chat(q: ChatRequest):
                 
                 # CASE 3 LLM FALLBACK - Generate answer using LLM for topic continuity
                 # Build context from conversation history for LLM prompt
-                llm_context = f"Based on our previous discussion about: {last_question}\nPrevious answer context: {last_answer[:200]}"
-                
-                llm_prompt = f"""
-{llm_context}
+                llm_prompt = f"""{last_answer[:500]}
 
-Question: {q.question}
-
-Answer this question directly as Dr. Robert O. Young. Do NOT say "As an AI" or refer to yourself in third person. Speak naturally and confidently as the expert. Provide a detailed, informative answer (3-5 sentences).
-"""
+Q: {q.question}
+A:"""
                 
                 # Generate answer using LLM for Case 3
                 llm_start = time.time()
@@ -633,19 +507,15 @@ Answer this question directly as Dr. Robert O. Young. Do NOT say "As an AI" or r
                 def stream_case3_response():
                     full_answer = ""
 
-                    # Stream the prefix immediately
-                    yield "Answer With AI:\n\n"
-                    
                     # Stream the LLM response chunks as they arrive
                     try:
-                        # Auto-select: Use Groq if available (cloud), otherwise Ollama (local)
-                        llm_function = call_groq_stream_direct if groq_client else call_llama2_stream_direct
+                        # Call Ollama LLM
+                        llm_function = call_llama2_stream_direct
                         for chunk in llm_function(llm_prompt):
                             if chunk.strip():  # Only yield non-empty chunks
                                 full_answer += chunk
                                 yield chunk
-                                # Add small delay to make response feel more natural
-                                time.sleep(0.05)  # Increased to 50ms delay between frontend updates
+                                time.sleep(0.01)  # Consistent streaming delay
                                 
                         # Save conversation AFTER streaming finishes
                         clean_answer = " ".join(full_answer.split())
@@ -670,7 +540,11 @@ Answer this question directly as Dr. Robert O. Young. Do NOT say "As an AI" or r
                 )
         
         def stream_general_response():
-            yield general_answer
+            # Split the general answer into words or chunks to maintain consistent speed
+            words = general_answer.split()
+            for i, word in enumerate(words):
+                yield word + (" " if i < len(words) - 1 else "")
+                time.sleep(0.01)  # Consistent streaming delay
         
         return StreamingResponse(stream_general_response(), media_type="text/plain")
 
@@ -685,34 +559,59 @@ Answer this question directly as Dr. Robert O. Young. Do NOT say "As an AI" or r
             "title": art["title"],
             "url": art["url"]
         })
-        # Clean and truncate article content
-        cleaned = clean_context(art["content"][:4000])
-        context_parts.append(cleaned)
+        # Fetch full content only for top matched article
+        cur.execute("SELECT content FROM dr_young_all_articles WHERE id = %s", (art["id"],))
+        content_row = cur.fetchone()
+        if content_row:
+            cleaned = clean_context(content_row["content"])
+            context_parts.append(cleaned)
 
-    print("CONTEXT LENGTH:", len(context_parts))
+    print(f"\n{'='*60}")
+    print(f"[CONTEXT] {len(context_parts)} articles matched:")
+    for i, (score, art) in enumerate(scored, 1):
+        print(f"  [{i}] Title: {art['title']}")
+        print(f"      URL: {art['url']}")
+        print(f"      Score: {score:.3f}")
+    print(f"{'='*60}")
 
     # Join all context parts
     context = "\n\n".join(context_parts)
     context_time = time.time() - context_start
 
-    # 5️⃣ Format prompt for LLM with conversation context
-    prompt = f"""
-{history_context}The following is from your published articles and research:
+    # Log full context being sent to model
+    print(f"\n[CONTEXT → MODEL] Total Characters: {len(context)} | Sent to LLM: {len(context[:6000])}")
+    print(f"[QUESTION] {q.question}")
+    print(f"\n{'─'*60}")
+    print(f"[FULL CONTEXT FROM DB]:")
+    print(f"{'─'*60}")
+    print(context[:6000])
+    print(f"{'─'*60}")
+    print(f"[END CONTEXT]")
+    print(f"{'='*60}")
 
-{context}
+    # 5️⃣ Format prompt for LLM (strict context-only format)
+    prompt = f"""<|system|>
+You are a strict Q&A assistant for Dr. Robert O. Young's alkaline lifestyle research.
 
-Answer the following question directly as yourself. Do NOT say "As an AI" or "According to my research" - just answer naturally and confidently.
+RULES:
+1. ONLY use information from the CONTEXT below. Do NOT add outside knowledge.
+2. If context lacks the answer, say: "I don't have enough information based on the available articles."
+3. Do NOT invent, guess, or fabricate any facts not in the context.
+4. Start your answer directly. No preambles like "Sure!", "Based on the context..." etc.
+5. Use professional scientific tone. Be concise and accurate.
+6. Use numbered lists (1.) or bullet points (-). Each item on its own line.
+7. Always spell "Zeolite" (no accents) and "pH" (lowercase p, uppercase H).
+8. CRITICAL: When the context labels something as "FALSE" or a "myth", it means that claim is WRONG. Do NOT present false/myth claims as facts. Instead explain why they are wrong according to the context.
+9. Dr. Young PROMOTES the alkaline lifestyle. All answers should reflect his pro-alkaline position as stated in the context.
+10. Do NOT recommend fruits, dairy, sugar, or acidic foods as healthy unless the context explicitly says so.
+</s>
+<|user|>
+CONTEXT:
+{context[:6000]}
 
-STRICT RULES:
-1. ONLY use information from the context above. Do NOT add any facts, chemicals, or claims not present in the context.
-2. Include ALL specific numbers, percentages, measurements, and scientific terms exactly as they appear in the context. Do not skip any data.
-3. Include ALL specific chemical names, cell types, and scientific abbreviations mentioned in the context.
-4. Do NOT include any URLs or links. URLs will be added separately.
-5. Keep your answer concise but complete - cover all key points from the context.
-
-Question: {q.question}
-
-Answer:"""
+QUESTION: {q.question}
+</s>
+<|assistant|>"""
 
     llm_start = time.time()
 
@@ -720,36 +619,36 @@ Answer:"""
 
         full_answer = ""
 
-        # Stream the prefix immediately
-        yield "Answer With AI:\n\n"
-
-        # Stream the LLM response chunks as they arrive
+        # Stream the LLM response chunks as they become available
         try:
-            # Auto-select: Use Groq if available (cloud), otherwise Ollama (local)
-            llm_function = call_groq_stream if groq_client else call_llama2_stream
+            # Call Ollama LLM
+            llm_function = call_llama2_stream
             for chunk in llm_function(prompt):
-                if chunk.strip():  # Only yield non-empty chunks
+                if chunk.strip():
+                    chunk = chunk.replace("Zeolité", "Zeolite")
                     full_answer += chunk
                     yield chunk
-                    # Add small delay to make response feel more natural
-                    time.sleep(0.05)  # Increased to 50ms delay between frontend updates
-                    
-            # Extract URLs from article content and add them directly (not LLM-generated)
-            content_urls = re.findall(r'https?://[^\s\)]+', context)
-            # Also add article source URLs
+                    time.sleep(0.01)
+
+            # Extract URLs - Only show the verified source URLs to avoid "junk" or partial links
+            unique_references = []
+            seen_titles = set()
+            
             for ref in references:
-                if ref['url'] and ref['url'] not in content_urls:
-                    content_urls.append(ref['url'])
+                title_clean = ref['title'].strip().lower()
+                if title_clean not in seen_titles:
+                    unique_references.append(ref)
+                    seen_titles.add(title_clean)
 
-            if content_urls:
+            if unique_references:
                 yield "\n\nSee here for more info:\n"
-                for url in content_urls:
-                    yield f"{url}\n"
+                for ref in unique_references:
+                    if ref['url']:
+                        yield f"- {ref['url']}\n"
 
-            # Add references with article titles
-            yield "\nReferences:\n"
-            for i, ref in enumerate(references, 1):
-                yield f"{i}. {ref['title']}\n"
+                yield "\nReferences:\n"
+                for i, ref in enumerate(unique_references, 1):
+                    yield f"{i}. {ref['title']}\n"
 
             # Save conversation AFTER streaming finishes
             clean_answer = " ".join(full_answer.split())
@@ -763,6 +662,12 @@ Answer:"""
             print(f"Context: {context_time:.2f}s | LLM: {llm_time:.2f}s | Total: {total_time:.2f}s")
         except Exception as e:
             yield f"[LLM ERROR]: {str(e)}"
+        finally:
+            try:
+                cur.close()
+                conn.close()
+            except:
+                pass
 
     return StreamingResponse(
         stream_response(),

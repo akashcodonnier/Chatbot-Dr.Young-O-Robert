@@ -196,3 +196,30 @@ uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000
 8. What practical steps can I take to protect myself from the possible harmful effects of RF-EMFs?
 
 9. Does detoxification really help in dealing with wireless radiation and nano-material exposures, and if so, how?
+
+---
+
+## 🖥️ Server Commands
+
+**Restart chatbot service:**
+```bash
+sudo systemctl restart chatbot
+```
+
+**View live logs:**
+```bash
+journalctl -u chatbot -f
+```
+
+**ChatBOt Stop Command **
+``````sudo systemctl stop chatbot
+`````
+
+## 🔐 Server .env Configuration
+
+```
+DB_HOST=localhost
+DB_USER=root
+DB_PASSWORD=Root@2106db
+DB_NAME=case_studies_db
+```

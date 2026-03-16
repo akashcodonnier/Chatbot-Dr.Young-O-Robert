@@ -16,6 +16,9 @@ Key Features:
 
 import os
 import sys
+import time as _time
+import threading
+import subprocess
 from pathlib import Path
 
 # Add project root to Python path for module imports
@@ -92,6 +95,73 @@ async def health_check():
     """
     return {"status": "healthy", "service": "unified-server"}
 
+# ─── Auto-Scraper Scheduler ──────────────────────────────────────────────────
+_scrape_lock = threading.Lock()
+_scrape_running = False
+
+def _run_scheduled_scrape():
+    global _scrape_running
+    scraper_path = str(project_root / "scraper" / "scrape_and_embed.py")
+    python_path = sys.executable
+
+    _time.sleep(3600)  # Wait 1 hour after server start before first scrape
+
+    while True:
+        if _scrape_lock.locked():
+            print("[AUTO-SCRAPE] Previous scrape still running, skipping")
+        else:
+            with _scrape_lock:
+                _scrape_running = True
+                print(f"\n{'='*60}")
+                print(f"[AUTO-SCRAPE] Starting scrape at {_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"{'='*60}")
+                try:
+                    # Use Popen with -u (unbuffered) for real-time log streaming
+                    process = subprocess.Popen(
+                        [python_path, "-u", scraper_path],
+                        cwd=str(project_root),
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True
+                    )
+                    # Stream every log line in real-time
+                    for line in process.stdout:
+                        line = line.rstrip()
+                        if line:
+                            print(f"[AUTO-SCRAPE] {line}")
+                    process.wait(timeout=1800)
+
+                    if process.returncode == 0:
+                        print("[AUTO-SCRAPE] Scrape completed successfully")
+                    else:
+                        print(f"[AUTO-SCRAPE] Scrape failed (code {process.returncode})")
+
+                    # Refresh article cache
+                    print("[AUTO-SCRAPE] Refreshing article cache...")
+                    from backend.main import load_article_cache
+                    load_article_cache()
+                    print("[AUTO-SCRAPE] Cache refreshed")
+
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    print("[AUTO-SCRAPE] Scrape timed out (30 min limit)")
+                except Exception as e:
+                    print(f"[AUTO-SCRAPE] Error: {e}")
+                finally:
+                    _scrape_running = False
+
+        _time.sleep(3600)  # 1 hour
+
+def start_auto_scraper():
+    thread = threading.Thread(target=_run_scheduled_scrape, daemon=True)
+    thread.start()
+    print("[AUTO-SCRAPE] Scheduler started (every 1 hour)")
+
+@app.get("/health/scraper")
+async def scraper_status():
+    return {"scraper_running": _scrape_running, "interval_minutes": 60}
+# ──────────────────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
     # Startup banner with connection information
     print("=" * 60)
@@ -101,12 +171,16 @@ if __name__ == "__main__":
     print("Frontend: http://127.0.0.1:8000/")
     print("Backend API: http://127.0.0.1:8000/api/")
     print("API Docs: http://127.0.0.1:8000/api/docs")
+    print("Auto-scrape: Every 1 hour")
     print("=" * 60)
-    
-    # Start the server with auto-reload for development
+
+    # Start auto-scraper
+    start_auto_scraper()
+
+    # Start the server
     uvicorn.run(
         "unified_server:app",
         host="0.0.0.0",      # Listen on all interfaces
         port=8000,           # Standard development port
-        reload=True          # Auto-reload on code changes
+        reload=False         # Disabled for production
     )
