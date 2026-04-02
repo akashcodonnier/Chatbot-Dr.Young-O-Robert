@@ -358,23 +358,122 @@ def call_llama2_stream_direct(prompt: str):
 
 
 
+# ─── Identity Q&A (hardcoded per client) ─────────────────────────────────────
+IDENTITY_QA = {
+    "ai": "Yes I am an AI programmed by Team MasterPeace to help. To email a human on Team MasterPeace please email help@masterpeacebyhcs.com. If it takes too long to hear back, please reply to the email you already sent to follow up.",
+    "human": "No I am not a human. I am an AI programmed by Team MasterPeace to help. To email a human on Team MasterPeace please email help@masterpeacebyhcs.com. If it takes too long to hear back, please reply to the email you already sent to follow up.",
+    "bot": "Yes I am an AI bot programmed by Team MasterPeace to help. To email a human on Team MasterPeace please email help@masterpeacebyhcs.com. If it takes too long to hear back, please reply to the email you already sent to follow up.",
+    "real_person": "No, I am not a real person. I am an AI programmed by Team MasterPeace to help. To email a human on Team MasterPeace please email help@masterpeacebyhcs.com. If it takes too long to hear back, please reply to the email you already sent to follow up.",
+}
+
+def check_identity_question(question: str):
+    """Check if question is about the bot's identity and return hardcoded response"""
+    q_lower = question.lower().strip().rstrip("?!. ")
+
+    # Patterns for identity questions
+    ai_patterns = ["are you ai", "are you an ai", "are you artificial intelligence", "are you a robot", "are you machine", "are you a machine", "are you chatbot", "are you a chatbot", "are you chat bot"]
+    human_patterns = ["are you human", "are you a human", "are you a real human", "are you a person", "are you real person", "are you a real person"]
+    bot_patterns = ["are you a bot", "are you bot"]
+    who_patterns = ["who are you", "what are you"]
+
+    for p in ai_patterns:
+        if p in q_lower:
+            return IDENTITY_QA["ai"]
+    for p in human_patterns:
+        if p in q_lower:
+            return IDENTITY_QA["human"]
+    for p in bot_patterns:
+        if p in q_lower:
+            return IDENTITY_QA["bot"]
+    for p in who_patterns:
+        if p in q_lower:
+            return IDENTITY_QA["ai"]
+
+    return None
+
+
+# ─── Personal Question Filter ────────────────────────────────────────────────
+PERSONAL_RESPONSE = (
+    "I'm sorry, I'm not able to provide personal advice. "
+    "I am an AI programmed by Team MasterPeace to help with general information about "
+    "Dr. Robert Young's research and the alkaline lifestyle. "
+    "For personal assistance, please email help@masterpeacebyhcs.com. "
+    "If it takes too long to hear back, please reply to the email you already sent to follow up."
+)
+
+def check_personal_question(question: str):
+    """Check if question is a personal/medical advice request"""
+    q_lower = question.lower().strip()
+
+    personal_patterns = [
+        # Direct personal health advice
+        "what should i do", "what should i take", "what should i eat",
+        "what should i drink", "what can i do", "can you help me",
+        "help me with my", "i have been diagnosed", "i was diagnosed",
+        "my doctor said", "my doctor told", "i am suffering",
+        "i am sick", "i feel sick", "i'm sick", "im sick",
+        "what medicine", "what drug", "what treatment should",
+        "should i take", "should i use", "should i try",
+        "recommend for me", "suggest for me", "advise me",
+        "i have cancer", "i have diabetes", "i have disease",
+        "cure my", "treat my", "heal my",
+        "what do you recommend for my", "what would you suggest for my",
+        "how do i cure", "how do i treat", "how can i cure",
+        "can you diagnose", "can you prescribe",
+        "what is wrong with me", "am i sick",
+        "my symptoms", "i have symptoms",
+        "personal advice", "personal recommendation",
+        "what's your phone", "what's your number", "your email",
+        "where do you live", "where are you located", "your address",
+    ]
+
+    for p in personal_patterns:
+        if p in q_lower:
+            return PERSONAL_RESPONSE
+
+    return None
+# ──────────────────────────────────────────────────────────────────────────────
+
+
 @app.post("/chat")
 async def chat(q: ChatRequest):
     """
     Main chat endpoint that processes user questions with session-based memory
-    
+
     This endpoint performs semantic search on the blog database, maintains conversation
     context, and generates contextual answers using a local LLM.
-    
+
     Args:
         q (ChatRequest): The user's question request with optional conversation ID
-        
+
     Returns:
         StreamingResponse: Streaming response containing answer and references
     """
+    # Check for identity questions first (instant response, no LLM needed)
+    identity_answer = check_identity_question(q.question)
+    if identity_answer:
+        print(f"[IDENTITY] Matched identity question: '{q.question}'")
+        def stream_identity():
+            words = identity_answer.split()
+            for i, word in enumerate(words):
+                yield word + (" " if i < len(words) - 1 else "")
+                time.sleep(0.02)
+        return StreamingResponse(stream_identity(), media_type="text/plain")
+
+    # Check for personal questions (instant response, no LLM needed)
+    personal_answer = check_personal_question(q.question)
+    if personal_answer:
+        print(f"[PERSONAL] Matched personal question: '{q.question}'")
+        def stream_personal():
+            words = personal_answer.split()
+            for i, word in enumerate(words):
+                yield word + (" " if i < len(words) - 1 else "")
+                time.sleep(0.02)
+        return StreamingResponse(stream_personal(), media_type="text/plain")
+
     # Start timing for performance measurement
     start_time = time.time()
-    
+
     # Get conversation history
     history = get_conversation_history(q.conversation_id)
     

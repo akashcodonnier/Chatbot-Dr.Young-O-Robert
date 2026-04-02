@@ -215,11 +215,3 @@ journalctl -u chatbot -f
 ``````sudo systemctl stop chatbot
 `````
 
-## 🔐 Server .env Configuration
-
-```
-DB_HOST=localhost
-DB_USER=root
-DB_PASSWORD=Root@2106db
-DB_NAME=case_studies_db
-```

@@ -38,7 +38,7 @@ def get_connection():
     - DB_USER: Database username
     - DB_PASSWORD: Database password
     - DB_NAME: Database name
-
+    
     Returns:
         mysql.connector.connection.MySQLConnection: Database connection object
 

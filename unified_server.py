@@ -167,10 +167,10 @@ if __name__ == "__main__":
     print("=" * 60)
     print("UNIFIED SERVER STARTING")
     print("=" * 60)
-    print("Single URL for everything: http://192.168.1.4:8000")
-    print("Frontend: http://127.0.0.1:8000/")
-    print("Backend API: http://127.0.0.1:8000/api/")
-    print("API Docs: http://127.0.0.1:8000/api/docs")
+    print("Single URL for everything: http://192.168.1.4:8080")
+    print("Frontend: http://127.0.0.1:8080/")
+    print("Backend API: http://127.0.0.1:8080/api/")
+    print("API Docs: http://127.0.0.1:8080/api/docs")
     print("Auto-scrape: Every 1 hour")
     print("=" * 60)
 
@@ -181,6 +181,6 @@ if __name__ == "__main__":
     uvicorn.run(
         "unified_server:app",
         host="0.0.0.0",      # Listen on all interfaces
-        port=8000,           # Standard development port
+        port=8080,           # Standard development port
         reload=False         # Disabled for production
     )
